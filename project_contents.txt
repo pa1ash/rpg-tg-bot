@@ -1,0 +1,366 @@
+=========================================
+File: .env
+=========================================
+TOKEN=8865240443:AAFwPquRxKLghV6xIZ2lLEbQssKnThQon6U
+DATABASE_URL=postgresql+asyncpg://postgres:adm@localhost:5432/rpg_db
+
+=========================================
+File: config.py
+=========================================
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+=========================================
+File: constants.py
+=========================================
+from aiogram.filters.callback_data import CallbackData
+
+class RPGaction(CallbackData, prefix='rpg'):
+    action_type: str
+    target_id: int
+
+=========================================
+File: crud.py
+=========================================
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete
+from models import Character
+
+
+async def get_character(session: AsyncSession, telegram_id: int):
+    query = select(Character).where(Character.telegram_id == telegram_id)
+    result = await session.execute(query)
+    return result.scalar_one_or_none()
+
+async def add_character(session: AsyncSession,
+                        telegram_id: int, username: str, char_class: int,
+                        difficulty: int):
+    new_char = Character(
+        telegram_id = telegram_id,
+        username = username,
+        char_class = char_class,
+        difficulty = difficulty,
+    )
+
+    session.add(new_char)
+    await session.commit()
+    return new_char
+
+
+async def update_character_name(session: AsyncSession, telegram_id: int, new_name: str):
+    character = await get_character(session, telegram_id)
+    if character:
+        character.username = new_name
+        await session.commit()
+        return character
+    return None
+
+
+
+async def delete_character(session: AsyncSession, telegram_id: int):
+    character = await get_character(session, telegram_id)
+    if character:
+        await session.delete(character)
+        await session.commit()
+        return True
+    return False
+
+
+
+=========================================
+File: main.py
+=========================================
+import asyncio
+from aiogram import Bot, Dispatcher
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from config import TOKEN, DATABASE_URL
+from middlewares.db import DbSessionMiddleware
+from handlers.character_creation import router as character_router
+from menu import router as menu_router
+
+async def main():
+    print("Бот успешно запустился!")
+
+    engine = create_async_engine(DATABASE_URL, echo=True)
+    async_session = async_sessionmaker(engine, expire_on_commit=False)
+
+    bot = Bot(token=TOKEN)
+    dp = Dispatcher()
+
+    dp.update.outer_middleware(DbSessionMiddleware(session_maker=async_session))
+
+    dp.include_router(character_router)
+    dp.include_router(menu_router)
+
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+=========================================
+File: menu.py
+=========================================
+from aiogram import types, Router
+from aiogram.filters import Command, CommandObject
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from constants import RPGaction
+from sqlalchemy.ext.asyncio import AsyncSession
+from crud import get_character
+from handlers.character_creation import CLASSES
+from crud import update_character_name, delete_character
+import httpx
+
+router = Router()
+enemies = [ ('Гоблин', 1), ('Орк', 2), ('Дракон', 3), ('Скелет', 4), ('Король пауков', 5) , ('Вернуться назад', 0)]
+
+
+async def get_enemies_keyboard(array):
+    builder = InlineKeyboardBuilder()
+    for name, target_id in array:
+        if target_id != 0:
+            builder.add(types.InlineKeyboardButton(
+                text=f"Атаковать {name}",
+                callback_data=RPGaction(action_type="attack", target_id=target_id).pack()
+            ))
+        else:
+            builder.add(types.InlineKeyboardButton(
+                text= name,
+                callback_data = RPGaction(action_type='back', target_id=target_id).pack()
+            ))
+
+    builder.adjust(2)
+    return builder
+
+
+
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: types.Message):
+    url = f"http://127.0.0.1:8000/character?telegram_id={message.from_user.id}"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url)
+        data = response.json()
+
+
+    builder = await get_enemies_keyboard(enemies)
+    if "message" in data:
+        await message.answer(text="У вас еще нет персонажа! Используйте /create для создания.")
+        return
+
+    await message.answer(
+        text= f"⚔️Игрок: {data['username']}\nВыбранный класс: {CLASSES.get(data['char_class'])}\n\nВыбери противника для боя:",
+        reply_markup= builder.as_markup()
+    )
+
+@router.callback_query(RPGaction.filter())
+async def handle_rpg_actions(callback: types.CallbackQuery, callback_data: RPGaction ):
+    action = callback_data.action_type
+    target = callback_data.target_id
+
+    if action == 'attack':
+        await callback.answer()
+        back_builder = InlineKeyboardBuilder()
+        back_builder.add(types.InlineKeyboardButton(
+            text = "Вернуться назад",
+            callback_data= RPGaction(action_type='back', target_id=0).pack()
+        ))
+        await callback.message.edit_text(f"Вы выбрали атаку! Тип действия {action}, ID цели: {target}",
+                                         reply_markup=back_builder.as_markup())
+    if action == 'back':
+        await callback.answer()
+        builder = await get_enemies_keyboard(enemies)
+
+        await callback.message.edit_text(
+            text="Проверка на ***",
+            reply_markup= builder.as_markup()
+        )
+
+@router.message(Command("rename"))
+async def cmd_rename(message: types.Message,
+                     command: CommandObject):
+    new_name = command.args
+    if not new_name:
+        await message.answer(text="Введите имя после команды. Например: /rename 67покойо67")
+        return
+    payload = {
+        "telegram_id": message.from_user.id,
+        "new_name": new_name
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.patch("http://127.0.0.1:8000/character/rename", json=payload)
+    data = response.json()
+    await message.answer(data["message"])
+    return
+
+@router.message(Command("reset"))
+async def cmd_reset(message: types.Message):
+    url = f"http://127.0.0.1:8000/character?telegram_id={message.from_user.id}"
+    async with httpx.AsyncClient() as client:
+        response = await client.delete(url)
+    data = response.json()
+    await message.answer(data["message"])
+    return
+
+=========================================
+File: models.py
+=========================================
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import BigInteger, String, Integer
+
+class Base(DeclarativeBase):
+    pass
+
+class Character(Base):
+    __tablename__ = "characters"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger)
+    username: Mapped[str] = mapped_column(String(50))
+    char_class: Mapped[int] = mapped_column(Integer)
+    difficulty: Mapped[int] = mapped_column(Integer)
+
+    hp: Mapped[int] = mapped_column(Integer, default=100)
+    max_hp: Mapped[int] = mapped_column(Integer, default=100)
+    level: Mapped[int] = mapped_column(Integer, default=1)
+    xp: Mapped[int] = mapped_column(Integer, default=0)
+
+=========================================
+File: handlers/character_creation.py
+=========================================
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram import F, types, Router
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from sqlalchemy.ext.asyncio import AsyncSession
+from models import Character
+from constants import RPGaction
+from crud import get_character, add_character
+import httpx
+
+router = Router()
+
+class CharacterCreation(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_class = State()
+    waiting_for_difficulty = State()
+
+CLASSES = {
+    11: "Рыцарь",
+    12: "Маг",
+    13: "Кавалерия"
+}
+
+DIFFICULTIES = {
+    21: "Лёгкая",
+    22: "Средняя",
+    23: "Хард"
+}
+
+
+@router.message(CharacterCreation.waiting_for_name)
+async def process_name(message: types.Message, state: FSMContext):
+    await state.update_data(username=message.text)
+    await state.set_state(CharacterCreation.waiting_for_class)
+
+    builder = InlineKeyboardBuilder()
+    builder.add(types.InlineKeyboardButton(
+        text= "Рыцарь",
+        callback_data = RPGaction(action_type='choice', target_id=11).pack()
+    ))
+    builder.add(types.InlineKeyboardButton(
+        text= 'Маг',
+        callback_data= RPGaction(action_type="choice", target_id=12).pack()
+    ))
+    builder.add(types.InlineKeyboardButton(
+        text='Кавалерия',
+        callback_data= RPGaction(action_type="choice", target_id=13).pack()
+    ))
+    builder.adjust(1)
+
+    await message.answer(
+        text= 'Выберите класс',
+        reply_markup=builder.as_markup()
+    )
+
+@router.callback_query(RPGaction.filter(F.action_type == 'choice'), CharacterCreation.waiting_for_class)
+async def process_class_selection(callback: types.CallbackQuery, callback_data: RPGaction, state: FSMContext):
+    # Логика обработки выбора класса
+    await state.update_data(char_class=callback_data.target_id)
+
+    await state.set_state(CharacterCreation.waiting_for_difficulty)
+
+    builder = InlineKeyboardBuilder()
+    builder.add(types.InlineKeyboardButton(
+        text= "Лёгкая",
+        callback_data= RPGaction(action_type='difficulty', target_id=21).pack()
+    ))
+
+    builder.add(types.InlineKeyboardButton(
+        text= 'Средняя',
+        callback_data= RPGaction(action_type='difficulty', target_id=22).pack()
+    ))
+
+    builder.add(types.InlineKeyboardButton(
+        text= 'Хард',
+        callback_data= RPGaction(action_type='difficulty', target_id=23).pack()
+    ))
+
+    await callback.message.edit_text(
+        text= "Выберите сложность",
+        reply_markup= builder.as_markup()
+    )
+
+
+@router.callback_query(RPGaction.filter(F.action_type == 'difficulty'), CharacterCreation.waiting_for_difficulty)
+async def process_difficulty_selection(callback: types.CallbackQuery,
+                                       callback_data: RPGaction,
+                                       state: FSMContext):
+    await state.update_data(difficulty=callback_data.target_id)  # 💾 Сохраняем сложность
+
+    data = await state.get_data()
+    payload = data.copy()
+    payload["telegram_id"] = callback.from_user.id
+    async with httpx.AsyncClient() as client:
+        response = await client.post("http://127.0.0.1:8000/character", json=payload)
+
+    await state.clear()
+    await callback.message.edit_text(
+        text= f"Ваш персонаж:\nИмя: {data['username']}\nВыбранный класс: {CLASSES[data['char_class']]}\nСложность: {DIFFICULTIES[data['difficulty']]}"
+    )
+
+
+@router.message(Command("create"))
+async def cmd_create(message: types.Message, state: FSMContext):
+    url = f"http://127.0.0.1:8000/character?telegram_id={message.from_user.id}"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url)
+    data = response.json()
+
+    if "username" in data:
+        await message.answer(text="Персонаж уже создан! Используйте /menu чтобы начать/продолжить игру.")
+        return
+
+    await message.answer(text="Гоу создавать перса!\nВведи имя:")
+    await state.set_state(CharacterCreation.waiting_for_name)
+
+=========================================
+File: middlewares/db.py
+=========================================
+
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from aiogram import BaseMiddleware
+
+class DbSessionMiddleware(BaseMiddleware):
+    def __init__(self, session_maker: async_sessionmaker):
+        self.session_maker = session_maker
+    async def __call__(self, handler, event, data):
+        async with self.session_maker() as session:
+            data["session"] = session
+            return await handler(event, data)
+
